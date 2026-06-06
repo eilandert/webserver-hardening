@@ -39,7 +39,6 @@ Full **HPACK header compression** for HTTP/2 (Cloudflare). Upstream nginx
 only does static-table + Huffman; this adds dynamic-table encoding for response
 headers, cutting header bytes on multiplexed connections. Adds
 `http2_max_header_size` / `http2_max_field_size` tuning.
-Origin: <https://github.com/kn007/patch>.
 
 ### 4. [`nginx-ssl_cert_cb_yield.patch`](patches/nginx-ssl_cert_cb_yield.patch)
 OpenResty patch making `SSL_CTX_set_cert_cb()` callbacks **yield** for
