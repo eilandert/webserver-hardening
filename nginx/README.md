@@ -27,7 +27,7 @@ unchanged. Faster response compression on every request. Build-time only.
 Pair with `libz-ng-dev` from the repo.
 
 ### 2. [`nginx_dynamic_tls_records.patch`](patches/nginx_dynamic_tls_records.patch)
-Cloudflare/kn007 **dynamic TLS record sizing**. Sends small TLS records during
+Cloudflare **dynamic TLS record sizing**. Sends small TLS records during
 the first round-trips (fast first paint, no head-of-line stall) then grows to
 ~16 KB for bulk throughput. Adds directives:
 `ssl_dyn_rec_enable`, `ssl_dyn_rec_size_lo`, `ssl_dyn_rec_size_hi`,
