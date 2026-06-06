@@ -1,0 +1,324 @@
+Description: TLS certificate compression — brotli/zstd + algorithm selection.
+ OpenSSL 3.2+/4.0 implements RFC 8879 certificate compression internally for
+ every algorithm it was built with (zlib, brotli, zstd) and populates the
+ send-side preference order at SSL_CTX_new() time. nginx's existing
+ "ssl_certificate_compression on;" already drives it via
+ SSL_CTX_compress_certs(); this patch adds a companion directive
+ "ssl_certificate_compression_algorithms" (http/stream/mail) to restrict and
+ reorder the negotiated set via SSL_CTX_set1_cert_comp_preference(), e.g.
+ "ssl_certificate_compression_algorithms brotli zlib;". Algorithm IDs are the
+ RFC 8879 wire constants (zlib=1, brotli=2, zstd=3). The OpenSSL-only
+ preference call is version/lib-guarded; the BoringSSL/AWS-LC zlib-callback
+ path is left intact (warns if the new directive is used there). Brotli/zstd
+ require the OpenSSL build to be configured with enable-brotli / enable-zstd.
+ Verified zero-fuzz with -F0 on the full nginx patch stack.
+Forwarded: not-needed (depends on our openssl-nginx build options)
+Author: Thijs Eilander https://deb.myguard.nl/nginx-modules
+--- a/src/event/ngx_event_openssl.c
++++ b/src/event/ngx_event_openssl.c
+@@ -732,13 +732,53 @@
+ 
+ ngx_int_t
+ ngx_ssl_certificate_compression(ngx_conf_t *cf, ngx_ssl_t *ssl,
+-    ngx_uint_t enable)
++    ngx_uint_t enable, ngx_array_t *algorithms)
+ {
+     if (!enable) {
+         return NGX_OK;
+     }
+ 
+ #ifdef SSL_OP_NO_TX_CERTIFICATE_COMPRESSION
++
++    /*
++     * OpenSSL 3.2+ implements TLS certificate compression (RFC 8879)
++     * internally for every algorithm it was built with (zlib, brotli, zstd);
++     * the send-side preference order is populated at SSL_CTX_new() time.
++     * "ssl_certificate_compression_algorithms" lets the operator restrict
++     * and/or reorder that set via SSL_CTX_set1_cert_comp_preference().
++     */
++
++#if (OPENSSL_VERSION_NUMBER >= 0x30200000L \
++     && !defined OPENSSL_IS_BORINGSSL \
++     && !defined OPENSSL_IS_AWSLC \
++     && !defined LIBRESSL_VERSION_NUMBER)
++
++    if (algorithms != NULL && algorithms->nelts) {
++        int         *prefs;
++        ngx_uint_t   i, *alg;
++
++        prefs = ngx_palloc(cf->pool, algorithms->nelts * sizeof(int));
++        if (prefs == NULL) {
++            return NGX_ERROR;
++        }
++
++        alg = algorithms->elts;
++
++        for (i = 0; i < algorithms->nelts; i++) {
++            prefs[i] = (int) alg[i];
++        }
++
++        if (SSL_CTX_set1_cert_comp_preference(ssl->ctx, prefs,
++                                              algorithms->nelts)
++            == 0)
++        {
++            ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
++                          "SSL_CTX_set1_cert_comp_preference() failed");
++            return NGX_ERROR;
++        }
++    }
++
++#endif
+ 
+     if (SSL_CTX_compress_certs(ssl->ctx, 0) == 0) {
+         ngx_ssl_error(NGX_LOG_WARN, ssl->log, 0,
+@@ -749,6 +789,12 @@
+     SSL_CTX_clear_options(ssl->ctx, SSL_OP_NO_TX_CERTIFICATE_COMPRESSION);
+ 
+ #elif (NGX_ZLIB && defined TLSEXT_cert_compression_zlib)
++
++    if (algorithms != NULL) {
++        ngx_log_error(NGX_LOG_WARN, ssl->log, 0,
++                      "\"ssl_certificate_compression_algorithms\" is not "
++                      "supported on this platform, ignored");
++    }
+ 
+     if (SSL_CTX_add_cert_compression_alg(ssl->ctx, TLSEXT_cert_compression_zlib,
+                                          ngx_ssl_cert_compression_callback,
+@@ -769,6 +815,62 @@
+ #endif
+ 
+     return NGX_OK;
++}
++
++
++char *
++ngx_ssl_certificate_compression_algorithms(ngx_conf_t *cf, ngx_command_t *cmd,
++    void *conf)
++{
++    char  *p = conf;
++
++    ngx_str_t     *value;
++    ngx_uint_t     i, alg, *algp;
++    ngx_array_t  **algorithms;
++
++    algorithms = (ngx_array_t **) (p + cmd->offset);
++
++    if (*algorithms != NGX_CONF_UNSET_PTR) {
++        return "is duplicate";
++    }
++
++    *algorithms = ngx_array_create(cf->pool, cf->args->nelts - 1,
++                                   sizeof(ngx_uint_t));
++    if (*algorithms == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    value = cf->args->elts;
++
++    for (i = 1; i < cf->args->nelts; i++) {
++
++        /* RFC 8879 certificate compression algorithm identifiers */
++
++        if (ngx_strcmp(value[i].data, "zlib") == 0) {
++            alg = 1;
++
++        } else if (ngx_strcmp(value[i].data, "brotli") == 0) {
++            alg = 2;
++
++        } else if (ngx_strcmp(value[i].data, "zstd") == 0) {
++            alg = 3;
++
++        } else {
++            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                               "invalid TLS certificate compression "
++                               "algorithm \"%V\"", &value[i]);
++            return NGX_CONF_ERROR;
++        }
++
++        algp = ngx_array_push(*algorithms);
++        if (algp == NULL) {
++            return NGX_CONF_ERROR;
++        }
++
++        *algp = alg;
++    }
++
++    return NGX_CONF_OK;
+ }
+ 
+ 
+--- a/src/event/ngx_event_openssl.h
++++ b/src/event/ngx_event_openssl.h
+@@ -242,7 +242,9 @@
+     ngx_str_t *cert, ngx_str_t *key, ngx_ssl_cache_t *cache,
+     ngx_array_t *passwords);
+ ngx_int_t ngx_ssl_certificate_compression(ngx_conf_t *cf, ngx_ssl_t *ssl,
+-    ngx_uint_t enable);
++    ngx_uint_t enable, ngx_array_t *algorithms);
++char *ngx_ssl_certificate_compression_algorithms(ngx_conf_t *cf,
++    ngx_command_t *cmd, void *conf);
+ 
+ ngx_int_t ngx_ssl_ciphers(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *ciphers,
+     ngx_uint_t prefer_server_ciphers);
+--- a/src/http/modules/ngx_http_ssl_module.c
++++ b/src/http/modules/ngx_http_ssl_module.c
+@@ -136,6 +136,13 @@
+       ngx_conf_set_flag_slot,
+       NGX_HTTP_SRV_CONF_OFFSET,
+       offsetof(ngx_http_ssl_srv_conf_t, certificate_compression),
++      NULL },
++
++    { ngx_string("ssl_certificate_compression_algorithms"),
++      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
++      ngx_ssl_certificate_compression_algorithms,
++      NGX_HTTP_SRV_CONF_OFFSET,
++      offsetof(ngx_http_ssl_srv_conf_t, certificate_compression_algorithms),
+       NULL },
+ 
+     { ngx_string("ssl_dhparam"),
+@@ -649,6 +656,7 @@
+ 
+     sscf->prefer_server_ciphers = NGX_CONF_UNSET;
+     sscf->certificate_compression = NGX_CONF_UNSET;
++    sscf->certificate_compression_algorithms = NGX_CONF_UNSET_PTR;
+     sscf->early_data = NGX_CONF_UNSET;
+     sscf->reject_handshake = NGX_CONF_UNSET;
+     sscf->buffer_size = NGX_CONF_UNSET_SIZE;
+@@ -690,6 +698,9 @@
+     ngx_conf_merge_value(conf->certificate_compression,
+                          prev->certificate_compression, 0);
+ 
++    ngx_conf_merge_ptr_value(conf->certificate_compression_algorithms,
++                         prev->certificate_compression_algorithms, NULL);
++
+     ngx_conf_merge_value(conf->early_data, prev->early_data, 0);
+     ngx_conf_merge_value(conf->reject_handshake, prev->reject_handshake, 0);
+ 
+@@ -834,7 +845,8 @@
+         }
+ 
+         if (ngx_ssl_certificate_compression(cf, &conf->ssl,
+-                                            conf->certificate_compression)
++                                conf->certificate_compression,
++                                conf->certificate_compression_algorithms)
+             != NGX_OK)
+         {
+             return NGX_CONF_ERROR;
+--- a/src/http/modules/ngx_http_ssl_module.h
++++ b/src/http/modules/ngx_http_ssl_module.h
+@@ -19,6 +19,7 @@
+ 
+     ngx_flag_t                      prefer_server_ciphers;
+     ngx_flag_t                      certificate_compression;
++    ngx_array_t                    *certificate_compression_algorithms;
+     ngx_flag_t                      early_data;
+     ngx_flag_t                      reject_handshake;
+ 
+--- a/src/stream/ngx_stream_ssl_module.c
++++ b/src/stream/ngx_stream_ssl_module.c
+@@ -147,6 +147,13 @@
+       offsetof(ngx_stream_ssl_srv_conf_t, certificate_compression),
+       NULL },
+ 
++    { ngx_string("ssl_certificate_compression_algorithms"),
++      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_1MORE,
++      ngx_ssl_certificate_compression_algorithms,
++      NGX_STREAM_SRV_CONF_OFFSET,
++      offsetof(ngx_stream_ssl_srv_conf_t, certificate_compression_algorithms),
++      NULL },
++
+     { ngx_string("ssl_dhparam"),
+       NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+       ngx_conf_set_str_slot,
+@@ -917,6 +924,7 @@
+     sscf->conf_commands = NGX_CONF_UNSET_PTR;
+     sscf->prefer_server_ciphers = NGX_CONF_UNSET;
+     sscf->certificate_compression = NGX_CONF_UNSET;
++    sscf->certificate_compression_algorithms = NGX_CONF_UNSET_PTR;
+     sscf->reject_handshake = NGX_CONF_UNSET;
+     sscf->verify = NGX_CONF_UNSET_UINT;
+     sscf->verify_depth = NGX_CONF_UNSET_UINT;
+@@ -953,6 +961,9 @@
+     ngx_conf_merge_value(conf->certificate_compression,
+                          prev->certificate_compression, 0);
+ 
++    ngx_conf_merge_ptr_value(conf->certificate_compression_algorithms,
++                         prev->certificate_compression_algorithms, NULL);
++
+     ngx_conf_merge_value(conf->reject_handshake, prev->reject_handshake, 0);
+ 
+     ngx_conf_merge_bitmask_value(conf->protocols, prev->protocols,
+@@ -1090,7 +1101,8 @@
+         }
+ 
+         if (ngx_ssl_certificate_compression(cf, &conf->ssl,
+-                                            conf->certificate_compression)
++                                conf->certificate_compression,
++                                conf->certificate_compression_algorithms)
+             != NGX_OK)
+         {
+             return NGX_CONF_ERROR;
+--- a/src/stream/ngx_stream_ssl_module.h
++++ b/src/stream/ngx_stream_ssl_module.h
+@@ -19,6 +19,7 @@
+ 
+     ngx_flag_t        prefer_server_ciphers;
+     ngx_flag_t        certificate_compression;
++    ngx_array_t      *certificate_compression_algorithms;
+     ngx_flag_t        reject_handshake;
+ 
+     ngx_ssl_t         ssl;
+--- a/src/mail/ngx_mail_ssl_module.c
++++ b/src/mail/ngx_mail_ssl_module.c
+@@ -102,6 +102,13 @@
+       ngx_conf_set_flag_slot,
+       NGX_MAIL_SRV_CONF_OFFSET,
+       offsetof(ngx_mail_ssl_conf_t, certificate_compression),
++      NULL },
++
++    { ngx_string("ssl_certificate_compression_algorithms"),
++      NGX_MAIL_MAIN_CONF|NGX_MAIL_SRV_CONF|NGX_CONF_1MORE,
++      ngx_ssl_certificate_compression_algorithms,
++      NGX_MAIL_SRV_CONF_OFFSET,
++      offsetof(ngx_mail_ssl_conf_t, certificate_compression_algorithms),
+       NULL },
+ 
+     { ngx_string("ssl_dhparam"),
+@@ -322,6 +329,7 @@
+     scf->conf_commands = NGX_CONF_UNSET_PTR;
+     scf->prefer_server_ciphers = NGX_CONF_UNSET;
+     scf->certificate_compression = NGX_CONF_UNSET;
++    scf->certificate_compression_algorithms = NGX_CONF_UNSET_PTR;
+     scf->verify = NGX_CONF_UNSET_UINT;
+     scf->verify_depth = NGX_CONF_UNSET_UINT;
+     scf->builtin_session_cache = NGX_CONF_UNSET;
+@@ -353,6 +361,9 @@
+ 
+     ngx_conf_merge_value(conf->certificate_compression,
+                          prev->certificate_compression, 0);
++
++    ngx_conf_merge_ptr_value(conf->certificate_compression_algorithms,
++                         prev->certificate_compression_algorithms, NULL);
+ 
+     ngx_conf_merge_bitmask_value(conf->protocols, prev->protocols,
+                          (NGX_CONF_BITMASK_SET|NGX_SSL_DEFAULT_PROTOCOLS));
+@@ -458,7 +469,8 @@
+     }
+ 
+     if (ngx_ssl_certificate_compression(cf, &conf->ssl,
+-                                        conf->certificate_compression)
++                                conf->certificate_compression,
++                                conf->certificate_compression_algorithms)
+         != NGX_OK)
+     {
+         return NGX_CONF_ERROR;
+--- a/src/mail/ngx_mail_ssl_module.h
++++ b/src/mail/ngx_mail_ssl_module.h
+@@ -22,6 +22,7 @@
+ typedef struct {
+     ngx_flag_t       prefer_server_ciphers;
+     ngx_flag_t       certificate_compression;
++    ngx_array_t     *certificate_compression_algorithms;
+ 
+     ngx_ssl_t        ssl;
+ 

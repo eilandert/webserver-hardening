@@ -1,0 +1,199 @@
+diff -aurN openssl-openssl-4.0.0.orig/include/openssl/bio.h.in openssl-openssl-4.0.0/include/openssl/bio.h.in
+--- openssl-openssl-4.0.0.orig/include/openssl/bio.h.in	2026-04-14 14:04:16.000000000 +0200
++++ openssl-openssl-4.0.0/include/openssl/bio.h.in	2026-05-12 00:17:25.065026757 +0200
+@@ -297,6 +297,8 @@
+ /* Returned from the accept BIO when an accept would have blocked */
+ #define BIO_RR_ACCEPT 0x03
+ 
++# define BIO_RR_SSL_SESSION_LOOKUP 0x09
++
+ /* These are passed by the BIO callback */
+ #define BIO_CB_FREE 0x01
+ #define BIO_CB_READ 0x02
+diff -aurN openssl-openssl-4.0.0.orig/include/openssl/ssl.h.in openssl-openssl-4.0.0/include/openssl/ssl.h.in
+--- openssl-openssl-4.0.0.orig/include/openssl/ssl.h.in	2026-04-14 14:04:16.000000000 +0200
++++ openssl-openssl-4.0.0/include/openssl/ssl.h.in	2026-05-12 00:17:25.065026757 +0200
+@@ -937,6 +937,7 @@
+ #define SSL_ASYNC_NO_JOBS 6
+ #define SSL_CLIENT_HELLO_CB 7
+ #define SSL_RETRY_VERIFY 8
++#define SSL_SESS_LOOKUP 99
+ 
+ /* These will only be used when doing non-blocking IO */
+ #define SSL_want_nothing(s) (SSL_want(s) == SSL_NOTHING)
+@@ -947,6 +948,7 @@
+ #define SSL_want_async(s) (SSL_want(s) == SSL_ASYNC_PAUSED)
+ #define SSL_want_async_job(s) (SSL_want(s) == SSL_ASYNC_NO_JOBS)
+ #define SSL_want_client_hello_cb(s) (SSL_want(s) == SSL_CLIENT_HELLO_CB)
++#define SSL_want_sess_lookup(s) (SSL_want(s) == SSL_SESS_LOOKUP)
+ 
+ #define SSL_MAC_FLAG_READ_MAC_STREAM 1
+ #define SSL_MAC_FLAG_WRITE_MAC_STREAM 2
+@@ -1249,6 +1251,8 @@
+ #define SSL_ERROR_WANT_CLIENT_HELLO_CB 11
+ #define SSL_ERROR_WANT_RETRY_VERIFY 12
+ 
++#define SSL_ERROR_WANT_SESSION_LOOKUP 99
++#define SSL_ERROR_PENDING_SESSION 99 /* BoringSSL compatibility */
+ #ifndef OPENSSL_NO_DEPRECATED_3_0
+ #define SSL_CTRL_SET_TMP_DH 3
+ #define SSL_CTRL_SET_TMP_ECDH 4
+@@ -1787,6 +1791,7 @@
+ int SSL_SESSION_print_keylog(BIO *bp, const SSL_SESSION *x);
+ int SSL_SESSION_up_ref(SSL_SESSION *ses);
+ void SSL_SESSION_free(SSL_SESSION *ses);
++SSL_SESSION *SSL_magic_pending_session_ptr(void);
+ __owur int i2d_SSL_SESSION(const SSL_SESSION *in, unsigned char **pp);
+ __owur int SSL_set_session(SSL *to, SSL_SESSION *session);
+ int SSL_CTX_add_session(SSL_CTX *ctx, SSL_SESSION *session);
+diff -aurN openssl-openssl-4.0.0.orig/ssl/bio_ssl.c openssl-openssl-4.0.0/ssl/bio_ssl.c
+--- openssl-openssl-4.0.0.orig/ssl/bio_ssl.c	2026-04-14 14:04:16.000000000 +0200
++++ openssl-openssl-4.0.0/ssl/bio_ssl.c	2026-05-12 00:17:25.065026757 +0200
+@@ -143,6 +143,10 @@
+         BIO_set_retry_special(b);
+         retry_reason = BIO_RR_SSL_X509_LOOKUP;
+         break;
++    case SSL_ERROR_WANT_SESSION_LOOKUP:
++        BIO_set_retry_special(b);
++        retry_reason = BIO_RR_SSL_SESSION_LOOKUP;
++        break;
+     case SSL_ERROR_WANT_ACCEPT:
+         BIO_set_retry_special(b);
+         retry_reason = BIO_RR_ACCEPT;
+@@ -213,6 +217,10 @@
+         BIO_set_retry_special(b);
+         retry_reason = BIO_RR_SSL_X509_LOOKUP;
+         break;
++    case SSL_ERROR_WANT_SESSION_LOOKUP:
++        BIO_set_retry_special(b);
++        retry_reason = BIO_RR_SSL_SESSION_LOOKUP;
++        break;
+     case SSL_ERROR_WANT_CONNECT:
+         BIO_set_retry_special(b);
+         retry_reason = BIO_RR_CONNECT;
+@@ -378,6 +386,10 @@
+             BIO_set_retry_special(b);
+             BIO_set_retry_reason(b, BIO_RR_SSL_X509_LOOKUP);
+             break;
++        case SSL_ERROR_WANT_SESSION_LOOKUP:
++            BIO_set_retry_special(b);
++            BIO_set_retry_reason(b, BIO_RR_SSL_SESSION_LOOKUP);
++            break;
+         default:
+             break;
+         }
+diff -aurN openssl-openssl-4.0.0.orig/ssl/ssl_lib.c openssl-openssl-4.0.0/ssl/ssl_lib.c
+--- openssl-openssl-4.0.0.orig/ssl/ssl_lib.c	2026-04-14 14:04:16.000000000 +0200
++++ openssl-openssl-4.0.0/ssl/ssl_lib.c	2026-05-12 00:17:25.066026769 +0200
+@@ -5128,6 +5128,8 @@
+         return SSL_ERROR_WANT_ASYNC_JOB;
+     if (SSL_want_client_hello_cb(s))
+         return SSL_ERROR_WANT_CLIENT_HELLO_CB;
++    if (SSL_want_sess_lookup(s))
++        return SSL_ERROR_WANT_SESSION_LOOKUP;
+ 
+     if ((sc->shutdown & SSL_RECEIVED_SHUTDOWN) && (sc->s3.warn_alert == SSL_AD_CLOSE_NOTIFY))
+         return SSL_ERROR_ZERO_RETURN;
+diff -aurN openssl-openssl-4.0.0.orig/ssl/ssl_sess.c openssl-openssl-4.0.0/ssl/ssl_sess.c
+--- openssl-openssl-4.0.0.orig/ssl/ssl_sess.c	2026-04-14 14:04:16.000000000 +0200
++++ openssl-openssl-4.0.0/ssl/ssl_sess.c	2026-05-12 00:17:25.066026769 +0200
+@@ -20,6 +20,8 @@
+ #include "ssl_local.h"
+ #include "statem/statem_local.h"
+ 
++static const char g_pending_session_magic = 0;
++
+ static void SSL_SESSION_list_remove(SSL_CTX *ctx, SSL_SESSION *s);
+ static void SSL_SESSION_list_add(SSL_CTX *ctx, SSL_SESSION *s);
+ static int remove_session_lock(SSL_CTX *ctx, SSL_SESSION *c, int lck);
+@@ -525,6 +527,10 @@
+         ret = s->session_ctx->get_session_cb(SSL_CONNECTION_GET_USER_SSL(s),
+             sess_id, (int)sess_id_len, &copy);
+ 
++        if (ret == SSL_magic_pending_session_ptr()) {
++            return ret; /* Retry later */
++        }
++
+         if (ret != NULL) {
+             if (ret->not_resumable) {
+                 /* If its not resumable then ignore this session */
+@@ -621,6 +627,9 @@
+                 try_session_cache = 1;
+                 ret = lookup_sess_in_cache(s, hello->session_id,
+                     hello->session_id_len);
++                if (ret == SSL_magic_pending_session_ptr()) {
++                    return -2; /* Retry later */
++                }
+             }
+             break;
+         case SSL_TICKET_NO_DECRYPT:
+@@ -1100,6 +1109,11 @@
+     return s->peer_rpk;
+ }
+ 
++SSL_SESSION *SSL_magic_pending_session_ptr(void)
++{
++    return (SSL_SESSION *) &g_pending_session_magic;
++}
++
+ int SSL_SESSION_set1_id_context(SSL_SESSION *s, const unsigned char *sid_ctx,
+     unsigned int sid_ctx_len)
+ {
+diff -aurN openssl-openssl-4.0.0.orig/ssl/statem/statem_srvr.c openssl-openssl-4.0.0/ssl/statem/statem_srvr.c
+--- openssl-openssl-4.0.0.orig/ssl/statem/statem_srvr.c	2026-04-14 14:04:16.000000000 +0200
++++ openssl-openssl-4.0.0/ssl/statem/statem_srvr.c	2026-05-12 00:17:25.067026781 +0200
+@@ -1876,6 +1876,7 @@
+     SSL_CTX *sctx = SSL_CONNECTION_GET_CTX(s);
+     SSL *ssl = SSL_CONNECTION_GET_SSL(s);
+     SSL *ussl = SSL_CONNECTION_GET_USER_SSL(s);
++    PACKET saved_ciphers;
+ 
+     /* Finished parsing the ClientHello, now we can start processing it */
+     /* Give the ClientHello callback a crack at things */
+@@ -1946,6 +1947,7 @@
+     }
+ 
+     s->hit = 0;
++    saved_ciphers = clienthello->ciphersuites;
+ 
+     if (!ssl_cache_cipherlist(s, &clienthello->ciphersuites)
+         || !ossl_bytes_to_cipher_list(s, &clienthello->ciphersuites, &ciphers, &scsvs, 1)) {
+@@ -2039,6 +2041,10 @@
+         } else if (i == -1) {
+             /* SSLfatal() already called */
+             goto err;
++        } else if (i == -2) {
++            clienthello->ciphersuites = saved_ciphers;
++            s->rwstate = SSL_SESS_LOOKUP;
++            goto retry;
+         } else {
+             /* i == 0 */
+             if (!ssl_get_new_session(s, 1)) {
+@@ -2046,6 +2052,7 @@
+                 goto err;
+             }
+         }
++        s->rwstate = SSL_NOTHING;
+     }
+ 
+     if (SSL_CONNECTION_IS_TLS13(s)) {
+@@ -2315,6 +2322,11 @@
+     s->clienthello = NULL;
+ 
+     return 0;
++
++retry:
++    sk_SSL_CIPHER_free(ciphers);
++    sk_SSL_CIPHER_free(scsvs);
++    return -1;
+ }
+ 
+ /*
+diff -aurN openssl-openssl-4.0.0.orig/util/libssl.num openssl-openssl-4.0.0/util/libssl.num
+--- openssl-openssl-4.0.0.orig/util/libssl.num	2026-04-14 14:04:16.000000000 +0200
++++ openssl-openssl-4.0.0/util/libssl.num	2026-05-12 00:17:08.166833252 +0200
+@@ -626,3 +626,4 @@
+ SSL_set1_ech_config_list                626	4_0_0	EXIST::FUNCTION:ECH
+ SSL_get0_sigalg                         627	4_0_0	EXIST::FUNCTION:
+ SSL_get0_shared_sigalg                  628	4_0_0	EXIST::FUNCTION:
++SSL_magic_pending_session_ptr           629	4_0_0	EXIST::FUNCTION:
