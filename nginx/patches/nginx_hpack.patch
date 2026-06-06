@@ -1,5 +1,4 @@
-Description: Full HPACK encoding support for HTTP/2 (Cloudflare/kn007)
-Origin: https://github.com/kn007/patch
+Description: Full HPACK encoding support for HTTP/2 (Cloudflare)
 Forwarded: not-needed
 
 --- a/auto/modules
