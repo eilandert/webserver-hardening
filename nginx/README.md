@@ -35,7 +35,7 @@ the first round-trips (fast first paint, no head-of-line stall) then grows to
 (reorders fields — later TLS patches rebase onto this).
 
 ### 3. [`nginx_hpack.patch`](patches/nginx_hpack.patch)
-Full **HPACK header compression** for HTTP/2 (Cloudflare/kn007). Upstream nginx
+Full **HPACK header compression** for HTTP/2 (Cloudflare). Upstream nginx
 only does static-table + Huffman; this adds dynamic-table encoding for response
 headers, cutting header bytes on multiplexed connections. Adds
 `http2_max_header_size` / `http2_max_field_size` tuning.
