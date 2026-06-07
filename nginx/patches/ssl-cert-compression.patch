@@ -16,7 +16,7 @@ Forwarded: not-needed (depends on our openssl-nginx build options)
 Author: Thijs Eilander https://deb.myguard.nl/nginx-modules
 --- a/src/event/ngx_event_openssl.c
 +++ b/src/event/ngx_event_openssl.c
-@@ -732,13 +732,53 @@
+@@ -732,14 +732,70 @@
  
  ngx_int_t
  ngx_ssl_certificate_compression(ngx_conf_t *cf, ngx_ssl_t *ssl,
@@ -24,11 +24,16 @@ Author: Thijs Eilander https://deb.myguard.nl/nginx-modules
 +    ngx_uint_t enable, ngx_array_t *algorithms)
  {
      if (!enable) {
++        if (algorithms != NULL) {
++            ngx_log_error(NGX_LOG_WARN, ssl->log, 0,
++                          "\"ssl_certificate_compression_algorithms\" ignored "
++                          "while \"ssl_certificate_compression\" is off");
++        }
          return NGX_OK;
      }
  
  #ifdef SSL_OP_NO_TX_CERTIFICATE_COMPRESSION
-+
+ 
 +    /*
 +     * OpenSSL 3.2+ implements TLS certificate compression (RFC 8879)
 +     * internally for every algorithm it was built with (zlib, brotli, zstd);
@@ -62,35 +67,44 @@ Author: Thijs Eilander https://deb.myguard.nl/nginx-modules
 +            == 0)
 +        {
 +            ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
-+                          "SSL_CTX_set1_cert_comp_preference() failed");
++                          "SSL_CTX_set1_cert_comp_preference() failed; check "
++                          "that the OpenSSL build supports all of the "
++                          "requested algorithms (brotli/zstd require "
++                          "enable-brotli/enable-zstd)");
 +            return NGX_ERROR;
 +        }
 +    }
 +
-+#endif
- 
-     if (SSL_CTX_compress_certs(ssl->ctx, 0) == 0) {
-         ngx_ssl_error(NGX_LOG_WARN, ssl->log, 0,
-@@ -749,6 +789,12 @@
-     SSL_CTX_clear_options(ssl->ctx, SSL_OP_NO_TX_CERTIFICATE_COMPRESSION);
- 
- #elif (NGX_ZLIB && defined TLSEXT_cert_compression_zlib)
++#else
 +
 +    if (algorithms != NULL) {
 +        ngx_log_error(NGX_LOG_WARN, ssl->log, 0,
 +                      "\"ssl_certificate_compression_algorithms\" is not "
 +                      "supported on this platform, ignored");
 +    }
++
++#endif
++
+     if (SSL_CTX_compress_certs(ssl->ctx, 0) == 0) {
+         ngx_ssl_error(NGX_LOG_WARN, ssl->log, 0,
+                       "SSL_CTX_compress_certs() failed, ignored");
+@@ -750,6 +806,12 @@
  
+ #elif (NGX_ZLIB && defined TLSEXT_cert_compression_zlib)
+ 
++    if (algorithms != NULL) {
++        ngx_log_error(NGX_LOG_WARN, ssl->log, 0,
++                      "\"ssl_certificate_compression_algorithms\" is not "
++                      "supported on this platform, ignored");
++    }
++
      if (SSL_CTX_add_cert_compression_alg(ssl->ctx, TLSEXT_cert_compression_zlib,
                                           ngx_ssl_cert_compression_callback,
-@@ -769,6 +815,62 @@
- #endif
+                                          NULL)
+@@ -772,6 +834,72 @@
+ }
  
-     return NGX_OK;
-+}
-+
-+
+ 
 +char *
 +ngx_ssl_certificate_compression_algorithms(ngx_conf_t *cf, ngx_command_t *cmd,
 +    void *conf)
@@ -98,7 +112,7 @@ Author: Thijs Eilander https://deb.myguard.nl/nginx-modules
 +    char  *p = conf;
 +
 +    ngx_str_t     *value;
-+    ngx_uint_t     i, alg, *algp;
++    ngx_uint_t     i, n, alg, *algp;
 +    ngx_array_t  **algorithms;
 +
 +    algorithms = (ngx_array_t **) (p + cmd->offset);
@@ -135,6 +149,16 @@ Author: Thijs Eilander https://deb.myguard.nl/nginx-modules
 +            return NGX_CONF_ERROR;
 +        }
 +
++        algp = (*algorithms)->elts;
++        for (n = 0; n < (*algorithms)->nelts; n++) {
++            if (algp[n] == alg) {
++                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                                   "duplicate TLS certificate compression "
++                                   "algorithm \"%V\"", &value[i]);
++                return NGX_CONF_ERROR;
++            }
++        }
++
 +        algp = ngx_array_push(*algorithms);
 +        if (algp == NULL) {
 +            return NGX_CONF_ERROR;
@@ -144,9 +168,12 @@ Author: Thijs Eilander https://deb.myguard.nl/nginx-modules
 +    }
 +
 +    return NGX_CONF_OK;
- }
++}
++
++
+ #if (NGX_ZLIB && defined TLSEXT_cert_compression_zlib)
  
- 
+ static int
 --- a/src/event/ngx_event_openssl.h
 +++ b/src/event/ngx_event_openssl.h
 @@ -242,7 +242,9 @@
@@ -162,20 +189,20 @@ Author: Thijs Eilander https://deb.myguard.nl/nginx-modules
      ngx_uint_t prefer_server_ciphers);
 --- a/src/http/modules/ngx_http_ssl_module.c
 +++ b/src/http/modules/ngx_http_ssl_module.c
-@@ -136,6 +136,13 @@
-       ngx_conf_set_flag_slot,
-       NGX_HTTP_SRV_CONF_OFFSET,
+@@ -138,6 +138,13 @@
        offsetof(ngx_http_ssl_srv_conf_t, certificate_compression),
-+      NULL },
-+
+       NULL },
+ 
 +    { ngx_string("ssl_certificate_compression_algorithms"),
 +      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
 +      ngx_ssl_certificate_compression_algorithms,
 +      NGX_HTTP_SRV_CONF_OFFSET,
 +      offsetof(ngx_http_ssl_srv_conf_t, certificate_compression_algorithms),
-       NULL },
- 
++      NULL },
++
      { ngx_string("ssl_dhparam"),
+       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+       ngx_conf_set_str_slot,
 @@ -649,6 +656,7 @@
  
      sscf->prefer_server_ciphers = NGX_CONF_UNSET;
@@ -270,20 +297,20 @@ Author: Thijs Eilander https://deb.myguard.nl/nginx-modules
      ngx_ssl_t         ssl;
 --- a/src/mail/ngx_mail_ssl_module.c
 +++ b/src/mail/ngx_mail_ssl_module.c
-@@ -102,6 +102,13 @@
-       ngx_conf_set_flag_slot,
-       NGX_MAIL_SRV_CONF_OFFSET,
+@@ -104,6 +104,13 @@
        offsetof(ngx_mail_ssl_conf_t, certificate_compression),
-+      NULL },
-+
+       NULL },
+ 
 +    { ngx_string("ssl_certificate_compression_algorithms"),
 +      NGX_MAIL_MAIN_CONF|NGX_MAIL_SRV_CONF|NGX_CONF_1MORE,
 +      ngx_ssl_certificate_compression_algorithms,
 +      NGX_MAIL_SRV_CONF_OFFSET,
 +      offsetof(ngx_mail_ssl_conf_t, certificate_compression_algorithms),
-       NULL },
- 
++      NULL },
++
      { ngx_string("ssl_dhparam"),
+       NGX_MAIL_MAIN_CONF|NGX_MAIL_SRV_CONF|NGX_CONF_TAKE1,
+       ngx_conf_set_str_slot,
 @@ -322,6 +329,7 @@
      scf->conf_commands = NGX_CONF_UNSET_PTR;
      scf->prefer_server_ciphers = NGX_CONF_UNSET;
@@ -292,16 +319,16 @@ Author: Thijs Eilander https://deb.myguard.nl/nginx-modules
      scf->verify = NGX_CONF_UNSET_UINT;
      scf->verify_depth = NGX_CONF_UNSET_UINT;
      scf->builtin_session_cache = NGX_CONF_UNSET;
-@@ -353,6 +361,9 @@
- 
+@@ -354,6 +362,9 @@
      ngx_conf_merge_value(conf->certificate_compression,
                           prev->certificate_compression, 0);
-+
+ 
 +    ngx_conf_merge_ptr_value(conf->certificate_compression_algorithms,
 +                         prev->certificate_compression_algorithms, NULL);
- 
++
      ngx_conf_merge_bitmask_value(conf->protocols, prev->protocols,
                           (NGX_CONF_BITMASK_SET|NGX_SSL_DEFAULT_PROTOCOLS));
+ 
 @@ -458,7 +469,8 @@
      }
  
